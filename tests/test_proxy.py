@@ -401,6 +401,101 @@ class ProxyRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r2.status_code, 200)
         self.assertEqual(len(mock.calls), 3)
 
+    async def test_streaming_disconnect_does_not_leak_connection_pool(self):
+        from fastapi.responses import StreamingResponse
+
+        async def slow_upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                await reader.read(4096)
+                chunk = b'event: response.output_text.delta\ndata: {"delta":"hi"}\n\n'
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                    b"Transfer-Encoding: chunked\r\n\r\n"
+                    + f"{len(chunk):x}\r\n".encode()
+                    + chunk
+                    + b"\r\n"
+                )
+                await writer.drain()
+                await asyncio.sleep(2.0)
+            except Exception:
+                pass
+            finally:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+        class _FakeReq:
+            async def is_disconnected(self) -> bool:
+                return False
+
+        srv = await asyncio.start_server(slow_upstream, "127.0.0.1", 0)
+        port = srv.sockets[0].getsockname()[1]
+        client = httpx.AsyncClient(
+            limits=httpx.Limits(max_keepalive_connections=1, max_connections=2),
+            timeout=httpx.Timeout(10.0, pool=1.5),
+        )
+        try:
+            for _ in range(5):
+                req = client.build_request("POST", f"http://127.0.0.1:{port}/v1/responses")
+                resp = await client.send(req, stream=True)
+                prime = await proxy._prime_responses_sse(resp, _FakeReq())
+                self.assertEqual(prime.status, "commit")
+                gen = proxy._stream_generator(
+                    resp,
+                    primed_chunks=prime.primed_chunks,
+                    remainder=prime.remainder,
+                    queue=prime.queue,
+                    producer_task=prime.producer_task,
+                    producer_exc=prime.producer_exc,
+                )
+                sr = StreamingResponse(gen, media_type="text/event-stream")
+
+                async def receive():
+                    await asyncio.sleep(0.03)
+                    return {"type": "http.disconnect"}
+
+                async def send(_msg):
+                    pass
+
+                # Starlette 1.x requires the ASGI scope type; older supported
+                # releases accepted an empty mapping here.
+                await sr({"type": "http"}, receive, send)
+                self.assertTrue(resp.is_closed)
+        finally:
+            await client.aclose()
+            srv.close()
+            await asyncio.wait_for(srv.wait_closed(), timeout=3.0)
+
+    async def test_format_exc_and_transport_retry_logs_empty_message_type(self):
+        self.assertEqual(proxy._format_exc(httpx.PoolTimeout("")), "PoolTimeout")
+        self.assertEqual(proxy._format_exc(httpx.ConnectError("reset")), "ConnectError: reset")
+
+        class _FlakyPoolClient:
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            def build_request(self, **kwargs):
+                return httpx.Request(kwargs["method"], kwargs["url"])
+
+            async def send(self, _req, stream: bool = False):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise httpx.PoolTimeout("")
+                return httpx.Response(200, json={"ok": True})
+
+        proxy.STATS["transport_retries"] = 0
+        with self.assertLogs(proxy.logger, level="WARNING") as cm:
+            resp = await proxy._send_with_transport_retry(
+                _FlakyPoolClient(),
+                method="GET",
+                url="https://agentrouter.org/v1/models",
+                headers={},
+                max_retries=2,
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(any("PoolTimeout" in line for line in cm.output))
+
 
 class TestUpdaterAndHeadlessService(unittest.TestCase):
     def _run_git(self, cwd, *args):

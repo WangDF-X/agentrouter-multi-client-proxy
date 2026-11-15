@@ -23,6 +23,7 @@ This proxy eliminates this issue by:
 
 from __future__ import annotations
 
+import anyio
 import argparse
 import asyncio
 from contextlib import asynccontextmanager
@@ -61,6 +62,13 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("agentrouter-codex-proxy")
+
+
+def _format_exc(exc: BaseException) -> str:
+    """Format an exception including its type so empty messages never log blank."""
+    msg = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {msg}" if msg else name
 
 # ----------------------------------------------------------------------------
 # Resilient DNS Resolver (Fixes [Errno 11001] getaddrinfo failed permanently)
@@ -169,9 +177,14 @@ def _install_proactor_teardown_guard() -> None:
             return
         try:
             orig_call_connection_lost(self, exc)
-        except OSError:
-            if getattr(self, "_called_connection_lost", False):
-                raise
+        except OSError as caught:
+            # A protocol callback failure is not the benign socket-shutdown
+            # reset this guard exists for. CPython's finally block may already
+            # have detached everything, so distinguish it from shutdown()
+            # failure by whether _sock was cleared before the exception escaped.
+            if getattr(self, "_sock", None) is None:
+                self._called_connection_lost = True
+                raise caught
             sock = getattr(self, "_sock", None)
             if sock is not None:
                 try:
@@ -806,6 +819,7 @@ async def _send_with_transport_retry(
     params: Optional[dict] = None,
     stream: bool = False,
     max_retries: int = 5,
+    request: Optional[Request] = None,
 ) -> httpx.Response:
     """
     Sends an HTTP request with dedicated retries on connection, DNS, and transport errors.
@@ -825,14 +839,16 @@ async def _send_with_transport_retry(
             if method.upper() == "POST" and url == f"{UPSTREAM}/v1/responses":
                 STATS["responses_upstream_attempts"] += 1
             return await client.send(req, stream=stream)
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.ReadTimeout) as exc:
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
             last_exc = exc
             STATS["transport_retries"] += 1
             backoff_s = min(attempt * 0.75, 4.0)
             logger.warning(
-                "[Transport Retry %d/%d] %s: %s. Reconnecting in %.1fs...",
-                attempt, max_retries, type(exc).__name__, str(exc), backoff_s
+                "[Transport Retry %d/%d] %s. Reconnecting in %.1fs...",
+                attempt, max_retries, _format_exc(exc), backoff_s
             )
+            if request is not None and await _client_disconnected(request):
+                raise
             if attempt < max_retries:
                 await asyncio.sleep(backoff_s)
             else:
@@ -841,7 +857,12 @@ async def _send_with_transport_retry(
             last_exc = exc
             STATS["transport_retries"] += 1
             backoff_s = min(attempt * 0.75, 4.0)
-            logger.error("[Transport Error %d/%d] %s. Reconnecting in %.1fs...", attempt, max_retries, str(exc), backoff_s)
+            logger.error(
+                "[Transport Error %d/%d] %s. Reconnecting in %.1fs...",
+                attempt, max_retries, _format_exc(exc), backoff_s
+            )
+            if request is not None and await _client_disconnected(request):
+                raise
             if attempt < max_retries:
                 await asyncio.sleep(backoff_s)
             else:
@@ -990,14 +1011,20 @@ async def _close_sse_producer(
     upstream_response: Optional[httpx.Response],
     producer_task: Optional[asyncio.Task],
 ) -> None:
-    if producer_task is not None and not producer_task.done():
-        producer_task.cancel()
-        await asyncio.gather(producer_task, return_exceptions=True)
-    if upstream_response is not None:
+    # Starlette's StreamingResponse uses a level-triggered anyio CancelScope when
+    # a client disconnects; shield cleanup so upstream_response.aclose() always runs
+    # and releases its connection pool slot back to _SHARED_CLIENT.
+    with anyio.CancelScope(shield=True):
         try:
-            await upstream_response.aclose()
-        except Exception:
-            pass
+            if producer_task is not None and not producer_task.done():
+                producer_task.cancel()
+                await asyncio.gather(producer_task, return_exceptions=True)
+        finally:
+            if upstream_response is not None:
+                try:
+                    await upstream_response.aclose()
+                except Exception:
+                    pass
 
 
 def _parse_sse_frame(raw_frame: bytes) -> Tuple[str, Optional[Dict[str, Any]], str]:
@@ -1270,7 +1297,7 @@ async def _stream_generator(
             except asyncio.TimeoutError:
                 yield b": ping\n\n"
     except Exception as exc:
-        logger.warning("[Stream Exception] Upstream SSE connection interrupted: %s", str(exc))
+        logger.warning("[Stream Exception] Upstream SSE connection interrupted: %s", _format_exc(exc))
     finally:
         await _close_sse_producer(upstream_response, producer_task)
         if not last_event_seen:
@@ -1462,149 +1489,178 @@ async def handle_responses(request: Request):
                 content=req_content,
                 stream=True,
                 max_retries=5,
+                request=request,
             )
 
-            resp_headers = _clean_response_headers(resp.headers)
-            content_type = resp.headers.get("content-type", "")
+            stream_handed_off = False
+            try:
+                resp_headers = _clean_response_headers(resp.headers)
+                content_type = resp.headers.get("content-type", "")
 
-            if resp.status_code == 200 and "text/event-stream" in content_type.lower():
-                prime = await _prime_responses_sse(resp, request)
-                if prime.status == "commit":
+                if resp.status_code == 200 and "text/event-stream" in content_type.lower():
+                    prime = await _prime_responses_sse(resp, request)
+                    if prime.status == "commit":
+                        _clear_rate_limit_cooldown()
+                        if fallback_active or transient_retries > 0 or mismatch_attempts > 0:
+                            STATS["successful_recoveries"] += 1
+                            logger.info(
+                                "[Success] Request recovered (fallback=%s, retries=%d)!",
+                                fallback_active,
+                                transient_retries + mismatch_attempts + int(fallback_active),
+                            )
+                        stream_handed_off = True
+                        return StreamingResponse(
+                            _stream_generator(
+                                resp,
+                                primed_chunks=prime.primed_chunks,
+                                remainder=prime.remainder,
+                                queue=prime.queue,
+                                producer_task=prime.producer_task,
+                                producer_exc=prime.producer_exc,
+                                on_cross_resource_error=(
+                                    remember_late_stream_error if SESSION_MODE_MEMORY and session_id else None
+                                ),
+                            ),
+                            status_code=200,
+                            headers=resp_headers,
+                            media_type="text/event-stream",
+                        )
+
+                    if prime.status == "client_disconnected":
+                        return Response(status_code=499)
+
+                    if prime.status == "resource_mismatch":
+                        if activate_stateless_fallback("SSE 200 error", prime.error_message):
+                            await asyncio.sleep((RETRY_DELAY_MS / 1000.0) * max(1, mismatch_attempts))
+                            continue
+                        return JSONResponse(
+                            status_code=400,
+                            content={
+                                "error": prime.error_payload
+                                or {"message": prime.error_message, "code": prime.error_code}
+                            },
+                            headers={k: v for k, v in resp_headers.items() if k.lower() != "content-type"},
+                        )
+
+                    is_rl = prime.status == "retry_rate_limit"
+                    STATS["stream_precommit_retries"] += 1
+                    should_retry, suggested_ra = await schedule_transient_wait(
+                        is_rl,
+                        resp.headers,
+                        prime.error_message,
+                        "Rate Limit / SSE" if is_rl else "Stream Pre-Commit",
+                    )
+                    if should_retry:
+                        continue
+                    if await _client_disconnected(request):
+                        return Response(status_code=499)
+                    if is_rl:
+                        logger.error("[Forwarding Rate Limit 429] Exhausted retries: %s", prime.error_message[:200])
+                        return _rate_limit_error_response(
+                            prime.error_payload, prime.error_message, prime.error_code, suggested_ra, resp_headers
+                        )
+                    logger.error("[Forwarding Stream Error 502] %s", prime.error_message[:200])
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": {
+                                "message": prime.error_message or "Upstream stream failed before emitting output",
+                                "type": "proxy_error",
+                            }
+                        },
+                    )
+
+                if resp.status_code == 200:
+                    body = await resp.aread()
+                    await resp.aclose()
+                    parsed_body: Optional[Dict[str, Any]] = None
+                    try:
+                        obj = json.loads(body.decode("utf-8", errors="replace"))
+                        if isinstance(obj, dict):
+                            parsed_body = obj
+                    except Exception:
+                        pass
+
+                    if parsed_body is not None and (
+                        bool(parsed_body.get("error")) or parsed_body.get("status") == "failed"
+                    ):
+                        code, msg, err_obj = _extract_error_fields(parsed_body, "")
+                        if is_resource_mismatch_text(msg):
+                            if activate_stateless_fallback("JSON 200 error", msg):
+                                continue
+                            # Reference-only requests cannot be reconstructed.
+                            # Preserve the upstream JSON result instead of
+                            # counting a destructive retry as a recovery.
+                            return Response(content=body, status_code=200, headers=resp_headers)
+                        if _is_rate_limit_error(code, msg) or _is_transient_error(code, msg):
+                            is_rl = _is_rate_limit_error(code, msg)
+                            should_retry, suggested_ra = await schedule_transient_wait(
+                                is_rl, resp.headers, msg, "Rate Limit / JSON" if is_rl else "JSON Error"
+                            )
+                            if should_retry:
+                                continue
+                            if is_rl:
+                                return _rate_limit_error_response(err_obj, msg, code, suggested_ra, resp_headers)
+
                     _clear_rate_limit_cooldown()
                     if fallback_active or transient_retries > 0 or mismatch_attempts > 0:
                         STATS["successful_recoveries"] += 1
-                        logger.info(
-                            "[Success] Request recovered (fallback=%s, retries=%d)!",
-                            fallback_active, transient_retries + mismatch_attempts + int(fallback_active)
-                        )
-                    return StreamingResponse(
-                        _stream_generator(
-                            resp,
-                            primed_chunks=prime.primed_chunks,
-                            remainder=prime.remainder,
-                            queue=prime.queue,
-                            producer_task=prime.producer_task,
-                            producer_exc=prime.producer_exc,
-                            on_cross_resource_error=(
-                                remember_late_stream_error if SESSION_MODE_MEMORY and session_id else None
-                            ),
-                        ),
-                        status_code=200,
-                        headers=resp_headers,
-                        media_type="text/event-stream",
-                    )
+                        logger.info("[Success] Request recovered!")
+                    return Response(content=body, status_code=200, headers=resp_headers)
 
-                if prime.status == "client_disconnected":
-                    return Response(status_code=499)
-
-                if prime.status == "resource_mismatch":
-                    if activate_stateless_fallback("SSE 200 error", prime.error_message):
-                        await asyncio.sleep((RETRY_DELAY_MS / 1000.0) * max(1, mismatch_attempts))
-                        continue
-                    return JSONResponse(
-                        status_code=400,
-                        content={"error": prime.error_payload or {"message": prime.error_message, "code": prime.error_code}},
-                        headers={k: v for k, v in resp_headers.items() if k.lower() != "content-type"},
-                    )
-
-                is_rl = prime.status == "retry_rate_limit"
-                STATS["stream_precommit_retries"] += 1
-                should_retry, suggested_ra = await schedule_transient_wait(
-                    is_rl,
-                    resp.headers,
-                    prime.error_message,
-                    "Rate Limit / SSE" if is_rl else "Stream Pre-Commit",
-                )
-                if should_retry:
-                    continue
-                if await _client_disconnected(request):
-                    return Response(status_code=499)
-                if is_rl:
-                    logger.error("[Forwarding Rate Limit 429] Exhausted retries: %s", prime.error_message[:200])
-                    return _rate_limit_error_response(
-                        prime.error_payload, prime.error_message, prime.error_code, suggested_ra, resp_headers
-                    )
-                logger.error("[Forwarding Stream Error 502] %s", prime.error_message[:200])
-                return JSONResponse(
-                    status_code=502,
-                    content={"error": {"message": prime.error_message or "Upstream stream failed before emitting output", "type": "proxy_error"}},
-                )
-
-            if resp.status_code == 200:
-                body = await resp.aread()
+                # Non-200 HTTP status
+                err_body = await resp.aread()
                 await resp.aclose()
-                parsed_body: Optional[Dict[str, Any]] = None
-                try:
-                    obj = json.loads(body.decode("utf-8", errors="replace"))
-                    if isinstance(obj, dict):
-                        parsed_body = obj
-                except Exception:
-                    pass
+                err_text = err_body.decode("utf-8", errors="replace")
 
-                if parsed_body is not None and (
-                    bool(parsed_body.get("error")) or parsed_body.get("status") == "failed"
-                ):
-                    code, msg, err_obj = _extract_error_fields(parsed_body, "")
-                    if is_resource_mismatch_text(msg):
-                        if activate_stateless_fallback("JSON 200 error", msg):
-                            continue
-                        return Response(content=body, status_code=200, headers=resp_headers)
-                    elif _is_rate_limit_error(code, msg) or _is_transient_error(code, msg):
-                        is_rl = _is_rate_limit_error(code, msg)
-                        should_retry, suggested_ra = await schedule_transient_wait(
-                            is_rl, resp.headers, msg, "Rate Limit / JSON" if is_rl else "JSON Error"
-                        )
-                        if should_retry:
-                            continue
-                        if is_rl:
-                            return _rate_limit_error_response(err_obj, msg, code, suggested_ra, resp_headers)
+                if is_resource_mismatch_error(resp.status_code, err_text):
+                    if activate_stateless_fallback("Upstream 400", err_text):
+                        if mismatch_attempts > 0:
+                            await asyncio.sleep((RETRY_DELAY_MS / 1000.0) * mismatch_attempts)
+                        continue
+                    logger.error("[Forwarding Error %d] %s", resp.status_code, err_text[:200])
+                    return Response(content=err_body, status_code=resp.status_code, headers=resp_headers)
 
-                _clear_rate_limit_cooldown()
-                if fallback_active or transient_retries > 0 or mismatch_attempts > 0:
-                    STATS["successful_recoveries"] += 1
-                    logger.info("[Success] Request recovered!")
-                return Response(content=body, status_code=200, headers=resp_headers)
+                is_http_rl = resp.status_code == 429 or _is_rate_limit_error("", err_text)
+                if resp.status_code in (429, 502, 503, 504):
+                    should_retry, suggested_ra = await schedule_transient_wait(
+                        is_http_rl,
+                        resp.headers,
+                        err_text,
+                        f"Gateway {resp.status_code}",
+                    )
+                    if should_retry:
+                        continue
+                    if await _client_disconnected(request):
+                        return Response(status_code=499)
+                    if resp.status_code == 429 and not any(k.lower() == "retry-after" for k in resp_headers):
+                        resp_headers["retry-after"] = str(suggested_ra)
+                    logger.error("[Forwarding Error %d] %s", resp.status_code, err_text[:200])
+                    return Response(content=err_body, status_code=resp.status_code, headers=resp_headers)
 
-            # Non-200 HTTP status
-            err_body = await resp.aread()
-            await resp.aclose()
-            err_text = err_body.decode("utf-8", errors="replace")
-
-            if is_resource_mismatch_error(resp.status_code, err_text):
-                if activate_stateless_fallback("Upstream 400", err_text):
-                    if mismatch_attempts > 0:
-                        await asyncio.sleep((RETRY_DELAY_MS / 1000.0) * mismatch_attempts)
-                    continue
                 logger.error("[Forwarding Error %d] %s", resp.status_code, err_text[:200])
                 return Response(content=err_body, status_code=resp.status_code, headers=resp_headers)
-
-            is_http_rl = resp.status_code == 429 or _is_rate_limit_error("", err_text)
-            if resp.status_code in (429, 502, 503, 504):
-                should_retry, suggested_ra = await schedule_transient_wait(
-                    is_http_rl,
-                    resp.headers,
-                    err_text,
-                    f"Gateway {resp.status_code}",
-                )
-                if should_retry:
-                    continue
-                if await _client_disconnected(request):
-                    return Response(status_code=499)
-                if resp.status_code == 429 and not any(k.lower() == "retry-after" for k in resp_headers):
-                    resp_headers["retry-after"] = str(suggested_ra)
-                logger.error("[Forwarding Error %d] %s", resp.status_code, err_text[:200])
-                return Response(content=err_body, status_code=resp.status_code, headers=resp_headers)
-
-            logger.error("[Forwarding Error %d] %s", resp.status_code, err_text[:200])
-            return Response(content=err_body, status_code=resp.status_code, headers=resp_headers)
+            finally:
+                if not stream_handed_off and not resp.is_closed:
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            await resp.aclose()
+                        except Exception:
+                            pass
 
         except Exception as exc:
-            logger.error("[Attempt Exception] %s", str(exc))
+            err_detail = _format_exc(exc)
+            logger.error("[Attempt Exception] %s", err_detail)
             last_failure_response = JSONResponse(
                 status_code=502,
-                content={"error": {"message": f"Proxy upstream communication error: {str(exc)}", "type": "proxy_error"}},
+                content={
+                    "error": {
+                        "message": f"Proxy upstream communication error: {err_detail}",
+                        "type": "proxy_error",
+                    }
+                },
             )
-            should_retry, _ = await schedule_transient_wait(False, {}, str(exc), "Attempt Exception")
+            should_retry, _ = await schedule_transient_wait(False, {}, err_detail, "Attempt Exception")
             if should_retry:
                 continue
             return last_failure_response
@@ -1634,6 +1690,7 @@ async def passthrough_handler(request: Request, path: str):
             content=body,
             stream=False,
             max_retries=5,
+            request=request,
         )
         resp_headers = {
             k: v for k, v in resp.headers.items()
@@ -1641,10 +1698,11 @@ async def passthrough_handler(request: Request, path: str):
         }
         return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
     except Exception as exc:
-        logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, str(exc))
+        err_detail = _format_exc(exc)
+        logger.error("[Passthrough Error] %s -> %s: %s", request.method, target_url, err_detail)
         return JSONResponse(
             status_code=502,
-            content={"error": {"message": f"Proxy passthrough error: {str(exc)}", "type": "proxy_error"}}
+            content={"error": {"message": f"Proxy passthrough error: {err_detail}", "type": "proxy_error"}}
         )
 
 # ----------------------------------------------------------------------------
