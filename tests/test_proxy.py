@@ -82,6 +82,8 @@ class _QueuedMockTransport(httpx.AsyncBaseTransport):
         self.calls.append({
             "method": request.method,
             "url": str(request.url),
+            "headers": dict(request.headers),
+            "content": body_raw,
             "body": body_json,
             "t": time.monotonic(),
         })
@@ -123,6 +125,15 @@ def _reset_proxy_for_test(mock_transport: _QueuedMockTransport, overrides: dict 
     proxy.STATS["successful_recoveries"] = 0
     proxy.STATS["stateless_fallbacks_applied"] = 0
     proxy.STATS["resource_mismatches_caught"] = 0
+    for key in (
+        "responses_upstream_attempts", "requests_with_session_id", "requests_without_session_id",
+        "session_modes_activated", "preemptive_sanitizations", "preemptive_sanitization_skipped",
+        "unsafe_recovery_skipped",
+    ):
+        proxy.STATS[key] = 0
+    for counters in proxy.STATS["clients"].values():
+        for key in counters:
+            counters[key] = 0
     proxy._SHARED_CLIENT = httpx.AsyncClient(transport=mock_transport, timeout=proxy.CLIENT_TIMEOUT)
     proxy.RATE_LIMIT_BASE_DELAY_S = 0.05
     proxy.RATE_LIMIT_MAX_DELAY_S = 0.25
@@ -291,7 +302,6 @@ class ProxyRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         payload = {
             "model": "gpt-6.1-sol",
-            "previous_response_id": "resp_old",
             "input": [{"type": "reasoning", "id": "rs_1"}, {"type": "message", "id": "msg_1", "role": "user", "content": "hi"}],
             "stream": True,
         }
