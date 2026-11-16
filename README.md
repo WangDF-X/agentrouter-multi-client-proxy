@@ -126,6 +126,7 @@ Common settings:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `AGENTROUTER_UPSTREAM` | `https://agentrouter.org` | Upstream gateway base URL |
+| `PROXY_DNS_FALLBACKS` | unset | Optional fallback IPs for upstream hosts when DNS resolution fails, e.g. `ps.air-outer.com:8.214.160.125,8.214.161.192` |
 | `CODEX_GATEWAY_API_KEY` / `AGENTROUTER_API_KEY` | unset | Fallback authorization only when the incoming request has none |
 | `PROXY_PORT` | `8788` | Local listening port |
 | `PROXY_SESSION_MODE_MEMORY` | `1` | Enable persistent per-session sanitization flags |
@@ -243,6 +244,26 @@ Reset returns the session to passthrough mode until it encounters another cross-
 - `POST /_session/reset` — reset one session mode; loopback only
 
 No raw identities or credentials are returned by health and statistics endpoints.
+
+## DNS resilience for custom upstreams
+
+The proxy keeps a bounded in-memory DNS cache for every upstream host it
+resolves successfully. If the system resolver later has a transient failure
+(`Temporary failure in name resolution`), the last known addresses are reused
+so an already-working upstream keeps working.
+
+For a custom or region-specific upstream whose IP is not built in, configure a
+fallback explicitly. This avoids depending on the server's DNS at all:
+
+```dotenv
+PROXY_DNS_FALLBACKS=ps.air-outer.com:8.214.160.125,8.214.161.192
+```
+
+Format is `host:ip,ip;other-host:ip`. Host names are case-insensitive and IPs
+are validated; malformed entries are logged and ignored. Fallbacks are only
+consulted after both the system resolver and the DNS cache fail. Because this
+value is read at request time, it also works when set in `.env` (which the
+proxy loads after the DNS module is imported).
 
 ## Tests
 

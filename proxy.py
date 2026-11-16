@@ -75,49 +75,114 @@ def _format_exc(exc: BaseException) -> str:
 # ----------------------------------------------------------------------------
 _ORIG_GETADDRINFO = socket.getaddrinfo
 
-# Pre-seeded fallback IP addresses for upstream hosts
+# Built-in fallback IPs for the official AgentRouter domains only. Custom
+# upstreams (for example a China-region relay) can declare their own fallback
+# IPs through the PROXY_DNS_FALLBACKS environment variable; see _dns_fallback_ips.
 STATIC_DNS_FALLBACKS: Dict[str, List[str]] = {
     "agentrouter.org": ["8.214.160.125", "8.214.161.192"],
     "api.agentrouter.org": ["8.214.160.125", "8.214.161.192"],
 }
 
-# Dynamic in-memory DNS cache: updated whenever system DNS succeeds
+# Dynamic in-memory DNS cache: every successfully resolved host is cached, so a
+# transient resolver outage cannot break an upstream that already worked once.
 DYNAMIC_DNS_CACHE: Dict[str, List[tuple]] = {}
+_DNS_CACHE_MAX_HOSTS = 256
+
+
+def _parse_dns_fallbacks(raw: str) -> Dict[str, List[str]]:
+    """Parse PROXY_DNS_FALLBACKS: 'host:ip,ip;other-host:ip'.
+
+    Host names are normalized (lowercase, trailing dot removed) and IPs are
+    validated with ipaddress, so malformed entries never reach getaddrinfo.
+    """
+    parsed: Dict[str, List[str]] = {}
+    for entry in (raw or "").split(";"):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        host, _, ip_text = entry.partition(":")
+        host = host.strip().lower().rstrip(".")
+        if not host:
+            continue
+        addresses: List[str] = []
+        for candidate in ip_text.split(","):
+            candidate = candidate.strip()
+            if not candidate:
+                continue
+            try:
+                ipaddress.ip_address(candidate)
+            except ValueError:
+                logger.warning("[DNS Fallback] Ignoring invalid fallback IP %r for %s", candidate, host)
+                continue
+            if candidate not in addresses:
+                addresses.append(candidate)
+        if addresses:
+            parsed[host] = addresses
+    return parsed
+
+
+def _dns_fallback_ips(host: str) -> List[str]:
+    """Built-in plus environment-configured fallback IPs for one host.
+
+    The environment is read on every call because _load_env() runs after this
+    module-level code, and because the upstream may be changed at runtime.
+    """
+    ips = list(STATIC_DNS_FALLBACKS.get(host, ()))
+    for ip in _parse_dns_fallbacks(os.environ.get("PROXY_DNS_FALLBACKS", "")).get(host, ()):
+        if ip not in ips:
+            ips.append(ip)
+    return ips
+
 
 def resilient_getaddrinfo(host, port, *args, **kwargs):
     """
-    Bulletproof getaddrinfo hook:
-    1. Attempts standard OS getaddrinfo first.
-    2. On success, updates DYNAMIC_DNS_CACHE.
-    3. On failure (socket.gaierror), falls back to DYNAMIC_DNS_CACHE or STATIC_DNS_FALLBACKS.
+    Resolve with a bounded cache and configurable fallbacks:
+    1. Try the OS resolver; on success cache the result for EVERY host.
+    2. On a transient resolver failure, reuse the last good result.
+    3. If nothing was cached, use built-in or PROXY_DNS_FALLBACKS IPs.
     """
     if isinstance(host, (bytes, bytearray)):
         host_str = host.decode("utf-8", errors="ignore")
     else:
         host_str = str(host)
+    host_key = host_str.lower().rstrip(".")
 
     try:
         results = _ORIG_GETADDRINFO(host, port, *args, **kwargs)
-        if results and host_str in STATIC_DNS_FALLBACKS:
-            DYNAMIC_DNS_CACHE[host_str] = results
+        if results:
+            if host_key not in DYNAMIC_DNS_CACHE and len(DYNAMIC_DNS_CACHE) >= _DNS_CACHE_MAX_HOSTS:
+                DYNAMIC_DNS_CACHE.pop(next(iter(DYNAMIC_DNS_CACHE)), None)
+            DYNAMIC_DNS_CACHE[host_key] = results
         return results
-    except socket.gaierror as exc:
-        # Check if we have cached results from earlier successful queries
-        if host_str in DYNAMIC_DNS_CACHE:
-            cached = []
-            for item in DYNAMIC_DNS_CACHE[host_str]:
-                cached.append((item[0], item[1], item[2], item[3], (item[4][0], port)))
-            logger.warning("[DNS Fallback] getaddrinfo failed for %s. Using cached IPs: %s", host_str, [x[4][0] for x in cached])
-            return cached
+    except socket.gaierror:
+        cached = DYNAMIC_DNS_CACHE.get(host_key)
+        if cached:
+            rebuilt = []
+            for item in cached:
+                sockaddr = item[4]
+                if item[0] == socket.AF_INET and isinstance(sockaddr, tuple) and sockaddr:
+                    rebuilt.append((item[0], item[1], item[2], item[3], (sockaddr[0], port)))
+                elif item[0] == socket.AF_INET6 and isinstance(sockaddr, tuple) and len(sockaddr) >= 4:
+                    rebuilt.append((item[0], item[1], item[2], item[3], (sockaddr[0], port, sockaddr[2], sockaddr[3])))
+                else:
+                    rebuilt.append(item)
+            if rebuilt:
+                logger.warning(
+                    "[DNS Fallback] Resolver failed for %s; using %d cached address(es)",
+                    host_str, len(rebuilt),
+                )
+                return rebuilt
 
-        # Check if we have static fallback IPs
-        if host_str in STATIC_DNS_FALLBACKS:
-            fallback_ips = STATIC_DNS_FALLBACKS[host_str]
-            logger.warning("[DNS Fallback] getaddrinfo failed for %s. Using static fallback IPs: %s", host_str, fallback_ips)
-            results = []
-            for ip in fallback_ips:
-                results.append((socket.AF_INET, socket.SocketKind.SOCK_STREAM, 6, "", (ip, port)))
-            return results
+        fallback_ips = _dns_fallback_ips(host_key)
+        if fallback_ips:
+            logger.warning(
+                "[DNS Fallback] Resolver failed for %s; using configured fallback IPs: %s",
+                host_str, fallback_ips,
+            )
+            return [
+                (socket.AF_INET, socket.SocketKind.SOCK_STREAM, 6, "", (ip, port))
+                for ip in fallback_ips
+            ]
 
         raise
 

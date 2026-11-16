@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 import httpx
 
@@ -146,6 +147,63 @@ def _reset_proxy_for_test(mock_transport: _QueuedMockTransport, overrides: dict 
     if overrides:
         for k, v in overrides.items():
             setattr(proxy, k, v)
+
+
+class DnsFallbackTests(unittest.TestCase):
+    """DNS cache and configurable fallbacks for custom upstream hosts."""
+
+    def setUp(self):
+        self._saved_cache = dict(proxy.DYNAMIC_DNS_CACHE)
+        self._saved_env = os.environ.get("PROXY_DNS_FALLBACKS")
+        proxy.DYNAMIC_DNS_CACHE.clear()
+        os.environ.pop("PROXY_DNS_FALLBACKS", None)
+
+    def tearDown(self):
+        proxy.DYNAMIC_DNS_CACHE.clear()
+        proxy.DYNAMIC_DNS_CACHE.update(self._saved_cache)
+        if self._saved_env is None:
+            os.environ.pop("PROXY_DNS_FALLBACKS", None)
+        else:
+            os.environ["PROXY_DNS_FALLBACKS"] = self._saved_env
+
+    @staticmethod
+    def _result(ip="1.2.3.4", port=443):
+        return [(socket.AF_INET, socket.SocketKind.SOCK_STREAM, 6, "", (ip, port))]
+
+    def test_success_caches_every_host_not_only_static_fallbacks(self):
+        with patch.object(proxy, "_ORIG_GETADDRINFO", return_value=self._result()):
+            proxy.resilient_getaddrinfo("random.example", 443)
+        self.assertIn("random.example", proxy.DYNAMIC_DNS_CACHE)
+
+    def test_failure_uses_cached_result_with_requested_port(self):
+        with patch.object(proxy, "_ORIG_GETADDRINFO", return_value=self._result("5.6.7.8")):
+            proxy.resilient_getaddrinfo("cached.example", 443)
+
+        with patch.object(proxy, "_ORIG_GETADDRINFO", side_effect=socket.gaierror(-3, "temporary")):
+            result = proxy.resilient_getaddrinfo("cached.example", 8443)
+        self.assertEqual(result[0][4], ("5.6.7.8", 8443))
+
+    def test_failure_uses_env_configured_fallbacks_case_and_dot_insensitive(self):
+        os.environ["PROXY_DNS_FALLBACKS"] = "ps.air-outer.com:8.214.160.125, 8.214.161.192"
+        with patch.object(proxy, "_ORIG_GETADDRINFO", side_effect=socket.gaierror(-3, "temporary")):
+            result = proxy.resilient_getaddrinfo("PS.AIR-OUTER.COM.", 443)
+        self.assertEqual([r[4][0] for r in result], ["8.214.160.125", "8.214.161.192"])
+
+    def test_invalid_fallback_ip_is_ignored(self):
+        os.environ["PROXY_DNS_FALLBACKS"] = "x.example:not-an-ip,9.9.9.9"
+        with patch.object(proxy, "_ORIG_GETADDRINFO", side_effect=socket.gaierror(-3, "temporary")):
+            result = proxy.resilient_getaddrinfo("x.example", 443)
+        self.assertEqual([r[4][0] for r in result], ["9.9.9.9"])
+
+    def test_builtin_fallbacks_still_work(self):
+        with patch.object(proxy, "_ORIG_GETADDRINFO", side_effect=socket.gaierror(-3, "temporary")):
+            result = proxy.resilient_getaddrinfo("agentrouter.org", 443)
+        self.assertEqual([r[4][0] for r in result], ["8.214.160.125", "8.214.161.192"])
+
+    def test_unknown_host_without_fallback_still_raises(self):
+        with patch.object(proxy, "_ORIG_GETADDRINFO", side_effect=socket.gaierror(-3, "temporary")):
+            with self.assertRaises(socket.gaierror):
+                proxy.resilient_getaddrinfo("unknown.example", 443)
 
 
 class ProactorTeardownTests(unittest.TestCase):
