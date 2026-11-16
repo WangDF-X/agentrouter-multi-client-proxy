@@ -206,6 +206,22 @@ class DnsFallbackTests(unittest.TestCase):
                 proxy.resilient_getaddrinfo("unknown.example", 443)
 
 
+class TimeoutConfigTests(unittest.TestCase):
+    """All httpx/uvicorn timeout knobs are configurable and consistent."""
+
+    def test_client_timeout_uses_configurable_components(self):
+        self.assertEqual(proxy.CLIENT_TIMEOUT.connect, proxy.CONNECT_TIMEOUT_S)
+        self.assertEqual(proxy.CLIENT_TIMEOUT.read, proxy.READ_TIMEOUT_S)
+        self.assertEqual(proxy.CLIENT_TIMEOUT.write, proxy.WRITE_TIMEOUT_S)
+        self.assertEqual(proxy.CLIENT_TIMEOUT.pool, proxy.POOL_TIMEOUT_S)
+
+    def test_write_timeout_default_is_not_the_old_hardcoded_60s(self):
+        self.assertGreater(proxy.WRITE_TIMEOUT_S, 60.0)
+
+    def test_keepalive_timeout_default(self):
+        self.assertEqual(proxy.KEEPALIVE_TIMEOUT_S, 600.0)
+
+
 class ProactorTeardownTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "win32", "Windows ProactorEventLoop test")
     def test_simulated_winerror_10054_completes_teardown(self):

@@ -383,13 +383,21 @@ SSE_PRIME_CREATED_GRACE_S = float(os.environ.get("PROXY_SSE_PRIME_CREATED_GRACE_
 
 CONNECT_TIMEOUT_S = float(os.environ.get("PROXY_CONNECT_TIMEOUT_S", "20.0"))
 READ_TIMEOUT_S = float(os.environ.get("PROXY_READ_TIMEOUT_S", "600.0"))
+# Write covers uploading the request body to upstream. Large payloads (up to
+# PROXY_MAX_REQUEST_BYTES) on slow links need far more than the old hardcoded
+# 60s, which showed up as spurious 502 "Proxy upstream communication error".
+WRITE_TIMEOUT_S = float(os.environ.get("PROXY_WRITE_TIMEOUT_S", "180.0"))
+# Pool covers waiting for a free connection when all upstream slots are busy.
+POOL_TIMEOUT_S = float(os.environ.get("PROXY_POOL_TIMEOUT_S", "30.0"))
+# Uvicorn idle keep-alive between client requests (seconds).
+KEEPALIVE_TIMEOUT_S = float(os.environ.get("PROXY_KEEPALIVE_TIMEOUT_S", "600.0"))
 
 CLIENT_TIMEOUT = httpx.Timeout(
     timeout=READ_TIMEOUT_S,
     connect=CONNECT_TIMEOUT_S,
     read=READ_TIMEOUT_S,
-    write=60.0,
-    pool=30.0,
+    write=WRITE_TIMEOUT_S,
+    pool=POOL_TIMEOUT_S,
 )
 
 # Only these errors permanently switch a session to preemptive sanitization.
@@ -1785,4 +1793,4 @@ if __name__ == "__main__":
     url_host = f"[{LISTEN_HOST}]" if ":" in LISTEN_HOST and not LISTEN_HOST.startswith("[") else LISTEN_HOST
     print(f"[*] Starting agentrouter-codex-proxy on http://{url_host}:{PORT} ({bind_scope})")
     print(f"[*] Forwarding to upstream: {UPSTREAM}")
-    uvicorn.run(app, host=LISTEN_HOST, port=PORT, timeout_keep_alive=600, log_level="info")
+    uvicorn.run(app, host=LISTEN_HOST, port=PORT, timeout_keep_alive=int(KEEPALIVE_TIMEOUT_S), log_level="info")

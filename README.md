@@ -132,6 +132,9 @@ Common settings:
 | `PROXY_SESSION_MODE_MEMORY` | `1` | Enable persistent per-session sanitization flags |
 | `PROXY_MAX_REQUEST_BYTES` | `67108864` | Maximum encoded and decoded Responses body size |
 | `PROXY_MAX_IMAGES` | `35` | Images retained in one request |
+| `PROXY_WRITE_TIMEOUT_S` | `180.0` | Seconds allowed to upload the request body to upstream (was hardcoded at 60s; raise for large payloads on slow links) |
+| `PROXY_POOL_TIMEOUT_S` | `30.0` | Seconds allowed to wait for a free upstream connection slot |
+| `PROXY_KEEPALIVE_TIMEOUT_S` | `600.0` | Idle keep-alive seconds between client requests (uvicorn `--timeout-keep-alive`) |
 
 See `.env.example` for retry, timeout, logging, and updater settings. The bind host is deliberately a command-line option rather than an environment setting.
 

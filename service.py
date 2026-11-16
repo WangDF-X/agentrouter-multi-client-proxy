@@ -406,7 +406,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "--port",
                 str(args.port),
                 "--timeout-keep-alive",
-                "600",
+                str(int(float(os.environ.get("PROXY_KEEPALIVE_TIMEOUT_S", "600")))),
                 "--log-level",
                 "warning",
                 "--no-access-log",
