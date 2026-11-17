@@ -761,24 +761,31 @@ def remember_cross_resource_session(session_id: Optional[SessionIdentity], text:
                 session_id.client, SESSION_MODES.key_for(session_id)[:12],
             )
 
-def can_preemptively_sanitize(payload: Any) -> bool:
-    """Do not pretend ID-only/stored history can be reconstructed locally.
+CALL_ITEM_TYPES = frozenset({
+    "function_call", "custom_tool_call", "computer_call", "local_shell_call",
+    "shell_call", "apply_patch_call", "mcp_call",
+})
 
-    Clients must replay messages and matching tool calls, not only references
-    or tool outputs whose original calls live exclusively on the server.
+
+def preemptive_block_reason(payload: Any) -> str:
+    """Explain why a payload cannot be rebuilt as a self-contained request.
+
+    Returns "" when sanitization is safe. Clients must replay messages and
+    matching tool calls, not only references or tool outputs whose original
+    calls live exclusively on the server. Outputs that carry no ``call_id`` at
+    all (for example Codex-injected "agent" namespace results) are not
+    call-correlated; upstream accepts them with or without their item id, so
+    they must not block sanitization.
     """
     if not isinstance(payload, dict) or not isinstance(payload.get("input"), (list, str)):
-        return False
-    if any(payload.get(key) for key in (
+        return "payload has no replayable 'input'"
+    for key in (
         "previous_response_id", "response_id", "parent_id", "parent_response_id", "conversation"
-    )):
-        return False
+    ):
+        if payload.get(key):
+            return f"server-side state pointer {key!r}"
     if not isinstance(payload["input"], list):
-        return True
-    call_types = {
-        "function_call", "custom_tool_call", "computer_call", "local_shell_call",
-        "shell_call", "apply_patch_call", "mcp_call",
-    }
+        return ""
     called = set()
     for item in payload["input"]:
         if not isinstance(item, dict):
@@ -786,15 +793,26 @@ def can_preemptively_sanitize(payload: Any) -> bool:
         kind = item.get("type")
         if not isinstance(kind, str):
             continue
-        if kind == "item_reference" or kind == "compaction" or "encrypted_content" in item and kind != "reasoning":
+        if kind in ("item_reference", "compaction"):
             # Opaque compaction checkpoints cannot be reconstructed by stripping IDs.
-            return False
-        if kind in call_types and isinstance(item.get("call_id"), str):
+            return f"{kind!r} item"
+        if "encrypted_content" in item and kind != "reasoning":
+            return f"opaque encrypted_content on {kind!r}"
+        if kind in CALL_ITEM_TYPES and isinstance(item.get("call_id"), str):
             called.add(item["call_id"])
-        elif isinstance(kind, str) and kind.endswith("_call_output"):
-            if not isinstance(item.get("call_id"), str) or item["call_id"] not in called:
-                return False
-    return True
+        elif kind.endswith("_call_output"):
+            if "call_id" in item:
+                call_id = item.get("call_id")
+                if not isinstance(call_id, str) or not call_id:
+                    return f"malformed {kind} call_id"
+                if call_id not in called:
+                    return f"orphan {kind} for call_id {call_id!r}"
+    return ""
+
+
+def can_preemptively_sanitize(payload: Any) -> bool:
+    """True when the payload can be made stateless without losing context."""
+    return not preemptive_block_reason(payload)
 
 def is_resource_mismatch_error(status_code: int, body_text: str) -> bool:
     """Checks if an HTTP error response is due to cross-resource item mismatch or image limit."""
@@ -1426,6 +1444,15 @@ async def handle_responses(request: Request):
     finally:
         body_parts.clear()
 
+    if VERBOSE:
+        _input = body_json.get("input") if isinstance(body_json, dict) else None
+        logger.info(
+            "[Request] responses body=%.2f MB content-encoding=%s input_items=%s",
+            len(body_bytes) / 1e6,
+            request.headers.get("content-encoding") or "identity",
+            len(_input) if isinstance(_input, list) else "n/a",
+        )
+
     headers = _filter_headers(dict(request.headers))
     session_id = extract_session_identity(request.headers, body_json)
     client_label = session_id.client if session_id else detect_client(request.headers, body_json)
@@ -1465,9 +1492,13 @@ async def handle_responses(request: Request):
         logger.warning("[Resource Mismatch] %s: %s", source_label, detail[:160])
         remember_cross_resource_session(session_id, detail)
         if not fallback_active and not preemptive_active and isinstance(body_json, dict):
-            if not can_preemptively_sanitize(active_payload):
+            block_reason = preemptive_block_reason(active_payload)
+            if block_reason:
                 STATS["unsafe_recovery_skipped"] += 1
-                logger.warning("[Recovery] Cannot reconstruct stored/reference-only history; forwarding error without losing context")
+                logger.warning(
+                    "[Recovery] Cannot rebuild history (%s); forwarding error without losing context",
+                    block_reason,
+                )
                 return False
             fallback_active = True
             payload_changed = True
@@ -1537,18 +1568,27 @@ async def handle_responses(request: Request):
                 elif not preemptive_skip_recorded:
                     preemptive_skip_recorded = True
                     STATS["preemptive_sanitization_skipped"] += 1
-                    logger.warning("[Session Mode] Stored-history reference present; retaining reactive recovery")
+                    logger.warning(
+                        "[Session Mode] Cannot sanitize yet (%s); retaining reactive recovery",
+                        preemptive_block_reason(active_payload) or "unknown",
+                    )
 
         # Healthy requests retain their exact bytes, including compression. A
-        # rewritten request is plain UTF-8 JSON, so NEVER keep content-encoding.
+        # rewritten request is plain UTF-8 JSON, so NEVER keep content-encoding
+        # (or the stale content-length): the upstream relays do not decode
+        # proxy-added zstd/gzip bodies and would fail JSON parsing.
         # ASCII escapes also preserve escaped Unicode from the original JSON
         # without letting an unpaired surrogate cause a local codec failure.
-        req_content = json.dumps(active_payload).encode("utf-8") if payload_changed else body_bytes
+        req_content = body_bytes
         req_headers = headers
         if payload_changed:
+            req_content = json.dumps(active_payload).encode("utf-8")
             req_headers = {
                 k: v for k, v in headers.items()
-                if k.lower() not in ("content-encoding", "content-md5", "digest", "content-digest", "repr-digest")
+                if k.lower() not in (
+                    "content-encoding", "content-length", "content-md5",
+                    "digest", "content-digest", "repr-digest",
+                )
             }
             req_headers["content-type"] = "application/json"
 
